@@ -123,9 +123,14 @@ export function mountApp(store: DriveStore, root: HTMLElement): void {
         ok ? `Node ${c.nodeId} · h${c.height ?? 0}` : "Offline demo (in-memory blobs)",
       ),
     );
+    if (c.core === "mock") {
+      connPill.append(el("span", { class: "conn-tag small", title: "Mock CRDT core (wasm not built)" }, "mock"));
+    }
     connPill.title = ok
-      ? "Connected to a local CE node; blobs are stored in its durable /blobs store."
-      : "No local node reachable on /ce — content is held in-memory for this session only.";
+      ? "Connected to a local CE node; blobs are stored in its durable /blobs store." +
+        (c.core === "mock" ? " Tree backed by the in-memory mock (wasm core not built)." : " Tree backed by the ce-drive-wasm move-CRDT.")
+      : "No local node reachable on /ce — content is held in-memory for this session only." +
+        (c.core === "mock" ? " Tree backed by the in-memory mock." : " Tree backed by the ce-drive-wasm move-CRDT.");
   }
 
   function render(): void {

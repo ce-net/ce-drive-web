@@ -4,10 +4,11 @@ import { defineConfig } from "vite";
 //
 // A pure-web SPA on @ce-net/sdk. It talks to a *local* CE node's HTTP API (:8844) for the
 // blob/object layer (chunked, CID-verified storage), and renders a DriveTree model — the
-// Kleppmann move-CRDT directory tree that ce-drive-core owns. In production the DriveTree
-// CRDT + sharing envelope are ce-drive-core compiled to WASM, running in the browser CE
-// node; until that WASM bridge is wired, the tree is backed by a thin in-memory mock
-// adapter (src/core/mock-adapter.ts) that mirrors the same TS client interface verbatim.
+// Kleppmann move-CRDT directory tree. The DriveTree CRDT is ce-drive-wasm (crates/
+// ce-drive-wasm) compiled to WASM via `npm run build:wasm` and loaded in the browser
+// (src/core/wasm-adapter.ts). `import.meta.glob` bundles the generated src/wasm/ artifact
+// into the build when present and tolerates its absence (the app then falls back to the
+// in-memory mock adapter, src/core/mock-adapter.ts, also reachable with `?mock=1`).
 //
 // In dev we proxy `/ce/*` to a local CE node so the browser is same-origin (no CORS). The
 // build is a static bundle (deploy like ce-host / ce-infer-ui).

@@ -6,7 +6,7 @@
  * go through the store so re-renders happen from one source of truth (the converged CRDT).
  */
 
-import { CeClient } from "@ce-net/sdk";
+import { CeClient, chunkObject, reassemble } from "@ce-net/sdk";
 import type { DriveCore, TreeSnapshot } from "../core/drive-core.js";
 import {
   MemoryBlobBackend,
@@ -14,10 +14,20 @@ import {
   NodeBlobBackend,
   type BlobBackend,
 } from "../core/mock-adapter.js";
+import {
+  backendsFromClient,
+  WasmDriveCore,
+  type ObjectBackend,
+  type OpTransport,
+} from "../core/wasm-adapter.js";
+import { WasmNotBuiltError } from "../core/wasm/load.js";
 import { ROOT, type NodeId } from "../core/model.js";
 
 /** Whether the content backend is a live node or the offline in-memory fallback. */
 export type Backend = "node" | "memory";
+
+/** Which DriveCore implementation is active: the real wasm CRDT or the in-memory mock. */
+export type CoreKind = "wasm" | "mock";
 
 export interface ConnectionState {
   backend: Backend;
@@ -25,6 +35,76 @@ export interface ConnectionState {
   nodeId?: string;
   /** Block height, when connected. */
   height?: number;
+  /** The active DriveCore implementation. */
+  core?: CoreKind;
+}
+
+/** Options accepted by {@link WasmDriveCore.create} (re-stated for the local `chain` typing). */
+type WasmCoreOpts = Parameters<typeof WasmDriveCore.create>[0];
+
+/** The mock store is opt-in: `?mock=1` or `localStorage.ceDriveMock=1`. Default is wasm. */
+function useMock(): boolean {
+  try {
+    const url = new URL(location.href);
+    if (url.searchParams.get("mock") === "1") return true;
+    if (url.searchParams.get("wasm") === "0") return true;
+    return localStorage.getItem("ceDriveMock") === "1";
+  } catch {
+    return false;
+  }
+}
+
+/** A no-op op transport for offline single-device wasm (the CRDT still works locally). */
+const NULL_TRANSPORT: OpTransport = {
+  publish: async () => {},
+  subscribe: async () => {},
+  messages: () => () => {},
+};
+
+/** Wrap a {@link MemoryBlobBackend} as an {@link ObjectBackend} (chunk/reassemble in-memory). */
+function memoryObjectBackend(mem: MemoryBlobBackend): ObjectBackend {
+  return {
+    putBlob: (b) => mem.putBlob(b),
+    getBlob: (h) => mem.getBlob(h),
+    async putObject(bytes) {
+      const { manifest, chunks } = await chunkObject(bytes);
+      for (const [, c] of chunks) await mem.putBlob(c);
+      const manifestBytes = new TextEncoder().encode(
+        JSON.stringify({
+          kind: manifest.kind,
+          chunk_size: manifest.chunkSize,
+          total_size: manifest.totalSize,
+          chunks: manifest.chunks,
+        }),
+      );
+      return mem.putBlob(manifestBytes);
+    },
+    async getObject(cid) {
+      const manifestBytes = await mem.getBlob(cid);
+      try {
+        const j = JSON.parse(new TextDecoder().decode(manifestBytes)) as {
+          kind?: string;
+          chunk_size?: number;
+          total_size?: number;
+          chunks?: string[];
+        };
+        if (j.kind === "ce-object-v1" && Array.isArray(j.chunks)) {
+          return reassemble(
+            {
+              kind: "ce-object-v1",
+              chunkSize: j.chunk_size ?? 0,
+              totalSize: j.total_size ?? 0,
+              chunks: j.chunks,
+            },
+            (c) => mem.getBlob(c),
+          );
+        }
+      } catch {
+        // Not a manifest — fall through and return the raw blob.
+      }
+      return manifestBytes;
+    },
+  };
 }
 
 type Listener = () => void;
@@ -49,22 +129,82 @@ export class DriveStore {
    */
   async init(): Promise<void> {
     const probe = await this.probeNode();
-    let blobs: BlobBackend;
     let selfId: string;
     if (probe) {
-      blobs = new NodeBlobBackend(probe.client.data);
       selfId = probe.nodeId;
-      this.connection = { backend: "node", nodeId: short(probe.nodeId), height: probe.height };
+      this.connection = {
+        backend: "node",
+        nodeId: short(probe.nodeId),
+        height: probe.height,
+        core: "wasm",
+      };
     } else {
-      blobs = new MemoryBlobBackend();
       selfId = "local-demo";
-      this.connection = { backend: "memory" };
+      this.connection = { backend: "memory", core: "wasm" };
     }
+
+    // Default to the REAL ce-drive-wasm CRDT core. Fall back to the in-memory mock only when
+    // explicitly requested (`?mock=1` / `localStorage.ceDriveMock`) or when the wasm bundle
+    // is not built (a fresh checkout before `npm run build:wasm`) — never silently in prod.
+    if (!useMock()) {
+      try {
+        const core = await this.initWasm(probe, selfId);
+        this.core = core;
+        await this.refresh();
+        return;
+      } catch (err) {
+        if (err instanceof WasmNotBuiltError) {
+          this.connection = { ...this.connection, core: "mock" };
+          // Fall through to the mock so the app still runs without the wasm artifact.
+        } else {
+          throw err;
+        }
+      }
+    } else {
+      this.connection = { ...this.connection, core: "mock" };
+    }
+
+    await this.initMock(probe, selfId);
+    await this.refresh();
+  }
+
+  /** Construct the production WasmDriveCore over the SDK (or offline single-device wasm). */
+  private async initWasm(
+    probe: { client: CeClient; nodeId: string } | null,
+    selfId: string,
+  ): Promise<WasmDriveCore> {
+    let objects: ObjectBackend;
+    let transport: OpTransport;
+    let chain: WasmCoreOpts["chain"] = null;
+    if (probe) {
+      const b = backendsFromClient(probe.client, probe.nodeId);
+      objects = b.objects;
+      transport = b.transport;
+      chain = b.chain;
+    } else {
+      // Offline: real content via an in-memory CID store, no op propagation (single device).
+      const mem = new MemoryBlobBackend();
+      objects = memoryObjectBackend(mem);
+      transport = NULL_TRANSPORT;
+    }
+    const core = await WasmDriveCore.create({ objects, transport, chain, self: selfId });
+    core.onChange(() => void this.refresh());
+    await core.seedDemo();
+    return core;
+  }
+
+  /** Construct the in-memory MockDriveCore (kept behind the flag / wasm-absent fallback). */
+  private async initMock(
+    probe: { client: CeClient } | null,
+    selfId: string,
+  ): Promise<void> {
+    const blobs: BlobBackend = probe
+      ? new NodeBlobBackend(probe.client.data)
+      : new MemoryBlobBackend();
     const core = new MockDriveCore(blobs, selfId);
     core.onChange(() => void this.refresh());
     await core.seedDemo();
     this.core = core;
-    await this.refresh();
   }
 
   /** Try to reach a local node via the `/ce` proxy path. Returns null if unreachable. */

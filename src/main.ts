@@ -4,16 +4,16 @@
  * The open-source Google Drive face of CE Drive (PLAN/10-drive-fs.md §8). A framework-free
  * TypeScript + Vite SPA over @ce-net/sdk.
  *
- * It renders a DriveTree model — the Kleppmann move-CRDT directory tree ce-drive-core owns
- * (§4) — and stores file *bytes* via the node's content-addressed blob layer (chunked,
- * CID-verified, §3.1) through the SDK. The tree/sharing/audit logic is, for now, served by
- * an in-memory mock adapter that mirrors ce-drive-core's surface verbatim
- * (src/core/mock-adapter.ts).
+ * It renders a DriveTree model — the Kleppmann move-CRDT directory tree — and stores file
+ * *bytes* via the node's content-addressed blob layer (chunked, CID-verified, §3.1) through
+ * the SDK. The tree / path / version / conflict logic is the REAL ce-drive-wasm CRDT core
+ * (src/core/wasm-adapter.ts → WasmDriveCore), compiled from crates/ce-drive-wasm and loaded
+ * in the browser; multi-device convergence rides a per-drive mesh merged-log.
  *
- * // TODO(ce-drive-core WASM bridge): swap MockDriveCore for WasmDriveCore — ce-drive-core
- * // compiled to WASM, running in the browser CE node, doing the real move-CRDT, ce-cap
- * // minting, on-chain audit reads, and (optional) E2E envelope. The UI is unchanged: it
- * // only depends on the DriveCore interface (src/core/drive-core.ts).
+ * The in-memory MockDriveCore (src/core/mock-adapter.ts) is kept as a fallback: it is used
+ * only when explicitly requested (`?mock=1`) or when the wasm bundle has not been built
+ * (`npm run build:wasm`). The UI depends solely on the DriveCore interface
+ * (src/core/drive-core.ts), so both adapters are drop-in.
  */
 
 import "./app.css";

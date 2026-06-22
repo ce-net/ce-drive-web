@@ -212,6 +212,17 @@ svg {
 .conn-pill.warn .conn-dot {
   color: var(--amber);
 }
+.conn-tag {
+  margin-left: 2px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--surface-1, var(--surface-2));
+  border: 1px solid var(--line);
+  color: var(--amber);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.7em;
+}
 
 .body {
   flex: 1 1 auto;
