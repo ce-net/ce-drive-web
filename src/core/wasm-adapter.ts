@@ -100,12 +100,39 @@ interface TrashShadow {
 }
 
 /**
- * The per-drive mesh topic for merged-log ops. A single shared workspace (v1: one drive per
- * node identity) keys the topic by a stable drive id so every device of that identity tails
- * the same op stream. Multi-tenant drives would derive this from the drive's root capability.
+ * The per-drive mesh topic for merged-log ops. The topic MUST be keyed by a stable drive id
+ * that is IDENTICAL on every device of the drive — not by the local device's node id. v1 has
+ * one drive per owning identity, so the drive id is the owning identity (derived from the
+ * drive's root capability / `chain.selfId`); multi-tenant drives derive it from the drive's
+ * root capability. Keying by the device node id would give each device its own topic, so two
+ * devices of the same owner would never see each other's ops and could never converge.
  */
 function driveTopic(driveId: string): string {
   return `ce-drive/ops/${driveId}`;
+}
+
+/**
+ * Cap on distinct ops remembered for dedup. Keyed by a short content hash of the op (not the
+ * full hex payload) so the set's memory is bounded for the life of the page. When the cap is
+ * exceeded the oldest-inserted key is evicted (insertion-ordered LRU via Map). A re-delivery
+ * of an evicted op is harmless: the CRDT integrate step is itself idempotent (it is the real
+ * dedup); this set is only a cheap fast-path that avoids re-decoding/re-applying hot ops.
+ */
+const SEEN_OPS_CAP = 4096;
+
+/** Cap on the in-memory replayable op log before it is snapshot-truncated (see {@link truncateOpLog}). */
+const OP_LOG_CAP = 8192;
+/** How many of the newest ops to retain after a truncate. */
+const OP_LOG_RETAIN = 2048;
+
+/** FNV-1a 32-bit hash of a string, hex-encoded — a short, stable dedup key for an op frame. */
+function shortHash(s: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0");
 }
 
 /** The blob key for the durable op-log snapshot (bootstrap for a device that was offline). */
@@ -122,7 +149,8 @@ export class WasmDriveCore implements DriveCore {
   private readonly trashShadows = new Map<NodeId, TrashShadow>();
   private readonly grants = new Map<string, ShareGrant>();
   private readonly auditLog: AuditEntry[] = [];
-  private readonly seenOps = new Set<string>();
+  /** Bounded dedup fast-path: short-op-hash -> true, insertion-ordered LRU (cap {@link SEEN_OPS_CAP}). */
+  private readonly seenOps = new Map<string, true>();
   private opLog: FramedOp[] = [];
   private unsub: (() => void) | undefined;
   private height = 1;
@@ -131,7 +159,10 @@ export class WasmDriveCore implements DriveCore {
     private readonly objects: ObjectBackend,
     private readonly transport: OpTransport,
     private readonly chain: ChainBackend | null,
+    /** This device's node id — used ONLY for CRDT op authorship, never for the topic. */
     private readonly self: string,
+    /** The stable, shared drive id — identical on every device; keys the convergence topic. */
+    private readonly driveId: string,
   ) {}
 
   /**
@@ -142,14 +173,19 @@ export class WasmDriveCore implements DriveCore {
     objects: ObjectBackend;
     transport: OpTransport;
     chain?: ChainBackend | null;
+    /** This device's node id (CRDT op authorship only). */
     self: string;
+    /**
+     * The stable, shared drive id that keys the convergence topic — IDENTICAL on every device
+     * of the drive. Derive it from the drive's root capability / owning identity. Defaults to
+     * the capability issuer (`chain.selfId`) when present (v1: one drive per owning identity),
+     * else to `self` for the offline single-device case.
+     */
+    driveId?: string;
   }): Promise<WasmDriveCore> {
-    const core = new WasmDriveCore(
-      opts.objects,
-      opts.transport,
-      opts.chain ?? null,
-      opts.self,
-    );
+    const chain = opts.chain ?? null;
+    const driveId = opts.driveId ?? chain?.selfId ?? opts.self;
+    const core = new WasmDriveCore(opts.objects, opts.transport, chain, opts.self, driveId);
     const { DriveCrdt } = await loadDriveWasm();
     core.crdt = new DriveCrdt(opts.self);
     await core.bootstrap();
@@ -162,7 +198,7 @@ export class WasmDriveCore implements DriveCore {
 
   /** Subscribe to the drive topic and begin tailing inbound ops from peers. */
   private async bootstrap(): Promise<void> {
-    const topic = driveTopic(this.self);
+    const topic = driveTopic(this.driveId);
     try {
       await this.transport.subscribe(topic);
       this.unsub = this.transport.messages(topic, (payload) => this.ingestFrame(payload));
@@ -180,14 +216,12 @@ export class WasmDriveCore implements DriveCore {
       return;
     }
     if (!frame || (frame.k !== "m" && frame.k !== "c") || typeof frame.b !== "string") return;
-    const dedupe = `${frame.k}:${frame.b}`;
-    if (this.seenOps.has(dedupe)) return;
-    this.seenOps.add(dedupe);
+    if (this.markSeen(frame)) return; // already seen — skip the re-decode/re-apply fast-path
     const bytes = fromHex(frame.b);
     try {
       if (frame.k === "m") this.crdt.applyMoveOp(bytes);
       else this.crdt.applyContentOp(bytes);
-      this.opLog.push(frame);
+      this.appendOpLog(frame);
       this.touch();
     } catch {
       // A malformed op from a peer must never crash the local view.
@@ -197,15 +231,42 @@ export class WasmDriveCore implements DriveCore {
   /** Apply a locally-minted op to the log + dedupe set, then publish it to peers. */
   private async emit(kind: "m" | "c", bytes: Uint8Array): Promise<void> {
     const frame: FramedOp = { k: kind, b: toHex(bytes) };
-    const dedupe = `${frame.k}:${frame.b}`;
-    if (!this.seenOps.has(dedupe)) {
-      this.seenOps.add(dedupe);
-      this.opLog.push(frame);
+    if (!this.markSeen(frame)) {
+      this.appendOpLog(frame);
     }
     try {
-      await this.transport.publish(driveTopic(this.self), utf8.encode(JSON.stringify(frame)));
+      await this.transport.publish(driveTopic(this.driveId), utf8.encode(JSON.stringify(frame)));
     } catch {
       // Offline: the op is applied locally; it will not converge until a node is reachable.
+    }
+  }
+
+  /**
+   * Record a frame in the bounded dedup set. Returns `true` if it was already present.
+   * Keyed by a short content hash (not the full hex payload) and evicted insertion-LRU once
+   * {@link SEEN_OPS_CAP} is exceeded, so memory stays bounded for the life of the page.
+   */
+  private markSeen(frame: FramedOp): boolean {
+    const key = `${frame.k}:${shortHash(frame.b)}`;
+    if (this.seenOps.has(key)) return true;
+    this.seenOps.set(key, true);
+    if (this.seenOps.size > SEEN_OPS_CAP) {
+      // Map preserves insertion order: the first key is the oldest. Evict down to the cap.
+      const overflow = this.seenOps.size - SEEN_OPS_CAP;
+      let dropped = 0;
+      for (const k of this.seenOps.keys()) {
+        this.seenOps.delete(k);
+        if (++dropped >= overflow) break;
+      }
+    }
+    return false;
+  }
+
+  /** Append to the replayable op log, snapshot-truncating to the newest tail when it grows. */
+  private appendOpLog(frame: FramedOp): void {
+    this.opLog.push(frame);
+    if (this.opLog.length > OP_LOG_CAP) {
+      this.opLog = this.opLog.slice(this.opLog.length - OP_LOG_RETAIN);
     }
   }
 
@@ -739,6 +800,21 @@ export class WasmDriveCore implements DriveCore {
 
   /** Exposed for debugging / tests: the durable op-log key (see {@link driveLogKey}). */
   static readonly logKey = driveLogKey();
+
+  /** The stable, shared drive id that keys the convergence topic (test/debug introspection). */
+  driveTopicId(): string {
+    return this.driveId;
+  }
+
+  /** Current size of the bounded dedup set (test/debug introspection). */
+  seenOpsSize(): number {
+    return this.seenOps.size;
+  }
+
+  /** Current length of the in-memory op log (test/debug introspection). */
+  opLogSize(): number {
+    return this.opLog.length;
+  }
 }
 
 // ---- pure helpers ------------------------------------------------------------------------
