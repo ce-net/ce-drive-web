@@ -53,12 +53,56 @@ bundled into the production build via `import.meta.glob`. When it is absent the 
 succeeds and the app degrades to the mock core at runtime (the connection pill shows a `mock`
 tag). `audit-view.ts` renders local activity facts plus the on-chain grant/revoke trail.
 
-## Content backend
+## Content backend — mesh-native, same-origin only
 
-On startup the app probes a local CE node via the `/ce` path (proxied to
-`http://127.0.0.1:8844` in dev; resolved by the reverse proxy in production). If reachable,
-uploads/downloads hit the node's durable `/blobs` store. If not, it falls back to an
-in-memory CID store so the app is fully demoable offline — the connection pill shows which.
+On startup the app probes the **local** CE node over the SDK's `connectNode()` rail
+(`src/store/drive-store.ts`). `connectNode()` is **same-origin by contract**:
+
+- an **in-browser node** (`window.__ceNode`, injected by the `ce-app serve` bridge) → the
+  in-process bridge transport, or
+- otherwise → the **same-origin reverse proxy at `/ce`** (dev: vite proxies `/ce` to
+  `http://127.0.0.1:8844`; prod / `ce-app serve`: the static host reverse-proxies `/ce` to
+  the local node at `127.0.0.1:8844`).
+
+If reachable, all blob/object I/O hits the node's durable `/blobs` store and op propagation
+rides the node's mesh pub/sub (`/mesh/*`). If not, the app falls back to an in-memory CID
+store so it is fully demoable offline — the connection pill shows which.
+
+**Invariant:** the shipped frontend talks to **nothing but its own origin**. There are no
+references to `ce-net.com/db`, `ce-net.com/rt`, `cast.ce-net.com`, `auth.ce-net.com`, or any
+cross-origin `fetch`/`WebSocket`/`EventSource`. Data, realtime, capabilities/auth (CE
+identity + `ce-cap`), and content (blobs) all flow through the local node. This holds under
+the **strict CSP** (`default-src 'self'; connect-src 'self'; …`, the SDK's `CE_STRICT_CSP`)
+that `ce-app serve` injects on every response — both transports above are same-origin, so the
+CSP never has to be loosened. The only non-`'self'`-looking string in the bundle is the SDK's
+in-process bridge sentinel `http://ce-browser-node.local`, which is intercepted by
+`bridgeFetch` and **never networked**.
+
+## Ship it over the mesh — `ce-app` (no central host)
+
+`ce-drive-web` deploys exactly like every other CE frontend, via the `ce-app` flow. Run these
+from this directory (or from the `ce-drive` repo with `--sub web`):
+
+```bash
+# 1) Register the app on the mesh — claims its name on-chain (POST /names/claim, the same
+#    path ce-expose uses) and advertises discovery, so it is reachable BY NAME, no hub index.
+ce-app register
+
+# 2) Serve it locally under the strict CSP — builds dist/, then runs a tiny static host that
+#    injects CE_STRICT_CSP + the same-origin bridge bootstrap + a "/ce" reverse proxy to the
+#    local node at 127.0.0.1:8844. The page can now reach ONLY its own origin (= the node).
+ce-app serve --sub web        # from ce-drive/ ; or plain `ce-app serve` from here
+
+# 3) Expose it over mesh HTTP ingress — runs the ce-expose ORIGIN agent against the serve
+#    port, carrying the local host onto https://drive-<nodeprefix>.user.ce-net.com.
+ce-app expose --domain drive-<nodeprefix> --sub web
+```
+
+`<nodeprefix>` is the first bytes of this node's ID (printed by `ce id` / `ce-app register`),
+so the public name is unique per node, e.g. `https://drive-25df8f15.user.ce-net.com`. The
+ingress terminates at `ce-net.com`, but the **served bytes and every runtime call stay
+same-origin to the user's local node over the mesh** — `ce-net.com` is dumb ingress, never a
+data plane.
 
 ## Develop
 
@@ -68,6 +112,13 @@ npm run build:wasm # wasm-pack build --target web ../ce-drive/crates/ce-drive-wa
 npm run dev        # http://localhost:5184
 npm run build      # tsc --noEmit && vite build → dist/ (bundles src/wasm/ when present)
 npm run typecheck
+```
+
+For a production-faithful run under the strict CSP (same-origin bridge + `/ce` proxy injected
+by `ce-app`), use `ce-app serve` instead of `npm run dev`:
+
+```bash
+ce-app serve              # builds dist/ and hosts it with CSP + bridge + same-origin /ce proxy
 ```
 
 `build:wasm` requires `wasm-pack` and the `wasm32-unknown-unknown` Rust target. It is

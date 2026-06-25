@@ -6,7 +6,7 @@
  * go through the store so re-renders happen from one source of truth (the converged CRDT).
  */
 
-import { CeClient, chunkObject, reassemble } from "@ce-net/sdk";
+import { CeClient, connectNode, chunkObject, reassemble } from "@ce-net/sdk";
 import type { DriveCore, TreeSnapshot } from "../core/drive-core.js";
 import {
   MemoryBlobBackend,
@@ -122,10 +122,15 @@ export class DriveStore {
    * Initialize: probe a local CE node for the blob backend, else fall back to memory; then
    * construct the DriveCore (mock adapter) and seed a demo tree.
    *
-   * In dev, `/ce` is proxied to `http://127.0.0.1:8844` (vite.config.ts) so the browser is
-   * same-origin. In production behind a reverse proxy, the same `/ce` path resolves to the
-   * local node. The node's read endpoints (`/blobs/:hash`) are unauthenticated; writes use
-   * the discovered API token where available.
+   * The node is reached over the SDK's `connectNode()` rail, which is SAME-ORIGIN by contract:
+   *  - an in-browser node (`window.__ceNode`) → the in-process bridge, or
+   *  - otherwise → the same-origin reverse proxy at `/ce` (dev: vite proxies `/ce` to
+   *    `http://127.0.0.1:8844`; prod/`ce-app serve`: the static server proxies `/ce` to the
+   *    local node at `127.0.0.1:8844`).
+   *
+   * Both transports are same-origin, so the strict CSP (`connect-src 'self'`) holds and the
+   * page can talk to nothing but its own local node. The node's read endpoints (`/blobs/:hash`)
+   * are unauthenticated; writes use the discovered API token where available.
    */
   async init(): Promise<void> {
     const probe = await this.probeNode();
@@ -207,11 +212,15 @@ export class DriveStore {
     this.core = core;
   }
 
-  /** Try to reach a local node via the `/ce` proxy path. Returns null if unreachable. */
+  /**
+   * Try to reach the local node over the SDK's same-origin `connectNode()` rail
+   * (in-browser `window.__ceNode` bridge, else the same-origin `/ce` proxy). Returns null
+   * if unreachable. No remote host is ever contacted — the CSP confines us to this origin.
+   */
   private async probeNode(): Promise<{ client: CeClient; nodeId: string; height: number } | null> {
     try {
-      // Same-origin proxy path; no token needed for `/status`.
-      const client = CeClient.withToken(`${location.origin}/ce`);
+      // Same-origin transport (bridge or `/ce`); no token needed for `/status`.
+      const client = connectNode();
       const status = (await Promise.race([
         client.getStatus(),
         timeout(1500),
